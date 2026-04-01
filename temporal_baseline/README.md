@@ -90,6 +90,16 @@ python train_srcnn.py --data_root ../data/vimeo_septuplet --epochs 20 --batch_si
 
 ```bash
 python evaluate_all.py --data_root ../data/vimeo_septuplet --checkpoint checkpoints/srcnn_best.pth
+
+# REDS val
+python evaluate_all.py --dataset reds --data_root /你的服务器路径/reds --checkpoint checkpoints/srcnn_best.pth
+
+# REDS4 (标准benchmark)
+python evaluate_all.py --dataset reds4 --data_root /你的服务器路径/reds --checkpoint checkpoints/srcnn_best.pth
+
+# Vimeo-90K
+python evaluate_all.py --dataset vimeo --data_root /你的服务器路径/vimeo_septuplet --checkpoint
+checkpoints/srcnn_best.pth
 ```
 
 ### 3. Or run individual experiments
