@@ -1,4 +1,4 @@
-"""Inference & Evaluation for Part 1 baselines on Vimeo-90K.
+"""Inference & Evaluation for Part 1 baselines on Vimeo-90K or REDS.
 
 Methods:
     1. bicubic      — Bicubic interpolation
@@ -7,17 +7,14 @@ Methods:
     4. temporal_avg — Multi-frame weighted averaging + optional Unsharp Masking
 
 Usage:
-    # Bicubic baseline
-    python inference.py --method bicubic --data_root ../../data/vimeo_septuplet
+    # Bicubic on REDS val
+    python inference.py --dataset reds --method bicubic --data_root /path/to/reds
 
-    # SRCNN
-    python inference.py --method srcnn --data_root ../../data/vimeo_septuplet --checkpoint checkpoints/srcnn_best.pth
+    # SRCNN on Vimeo
+    python inference.py --dataset vimeo --method srcnn --data_root /path/to/vimeo_septuplet --checkpoint checkpoints/srcnn_best.pth
 
-    # Temporal averaging (on top of bicubic)
-    python inference.py --method temporal_avg --data_root ../../data/vimeo_septuplet --unsharp
-
-    # Temporal averaging (on top of SRCNN)
-    python inference.py --method temporal_avg --data_root ../../data/vimeo_septuplet --base_method srcnn --checkpoint checkpoints/srcnn_best.pth --unsharp
+    # Temporal averaging + USM on REDS4
+    python inference.py --dataset reds4 --method temporal_avg --data_root /path/to/reds --base_method srcnn --checkpoint checkpoints/srcnn_best.pth --unsharp
 """
 
 import argparse
@@ -33,14 +30,14 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 from datasets.vimeo90k import Vimeo90KSeptuplet
+from datasets.reds import REDSDataset, REDS4Dataset
 from models.srcnn import SRCNN
-from utils.metrics import calc_psnr, calc_ssim, LPIPSMetric
+from utils.metrics import calc_psnr, calc_ssim
 
 
 # ───────────────────── Spatial upsampling methods ─────────────────────
 
 def upsample_bicubic(lr_np, scale):
-    """lr_np: HWC uint8 -> HWC uint8."""
     h, w = lr_np.shape[:2]
     return cv2.resize(lr_np, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
 
@@ -51,7 +48,6 @@ def upsample_lanczos(lr_np, scale):
 
 
 def upsample_srcnn(lr_np, scale, model, device):
-    """Bicubic upsample + SRCNN refinement."""
     h, w = lr_np.shape[:2]
     lr_up = cv2.resize(lr_np, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
     tensor = torch.from_numpy(lr_up).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
@@ -63,11 +59,7 @@ def upsample_srcnn(lr_np, scale, model, device):
 # ───────────────────── Temporal fusion ─────────────────────
 
 def temporal_weighted_average(frames, center_idx, window=3):
-    """Weighted average of neighboring frames around center_idx.
-
-    Gaussian-like weights: closer frames get higher weight.
-    frames: list of HWC uint8 arrays (all same size, already upscaled).
-    """
+    """Gaussian-weighted average of neighboring frames around center_idx."""
     half = window // 2
     start = max(0, center_idx - half)
     end = min(len(frames), center_idx + half + 1)
@@ -76,7 +68,7 @@ def temporal_weighted_average(frames, center_idx, window=3):
     selected = []
     for i in range(start, end):
         dist = abs(i - center_idx)
-        w = np.exp(-0.5 * dist ** 2)  # sigma=1 Gaussian
+        w = np.exp(-0.5 * dist ** 2)
         weights.append(w)
         selected.append(frames[i].astype(np.float64))
 
@@ -86,10 +78,7 @@ def temporal_weighted_average(frames, center_idx, window=3):
 
 
 def unsharp_mask(img, sigma=1.0, strength=0.5):
-    """Apply Unsharp Masking to enhance high-frequency edges.
-
-    USM(x) = x + strength * (x - GaussianBlur(x))
-    """
+    """USM(x) = x + strength * (x - GaussianBlur(x))"""
     blurred = cv2.GaussianBlur(img.astype(np.float64), (0, 0), sigma)
     sharpened = img.astype(np.float64) + strength * (img.astype(np.float64) - blurred)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
@@ -99,6 +88,9 @@ def unsharp_mask(img, sigma=1.0, strength=0.5):
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument('--dataset', type=str, default='reds',
+                   choices=['vimeo', 'reds', 'reds4'],
+                   help='vimeo=Vimeo-90K, reds=REDS val, reds4=REDS4 test')
     p.add_argument('--method', type=str, required=True,
                    choices=['bicubic', 'lanczos', 'srcnn', 'temporal_avg'])
     p.add_argument('--base_method', type=str, default='bicubic',
@@ -106,16 +98,30 @@ def parse_args():
                    help='Base spatial method for temporal_avg')
     p.add_argument('--data_root', type=str, required=True)
     p.add_argument('--scale', type=int, default=4)
-    p.add_argument('--checkpoint', type=str, default=None, help='SRCNN checkpoint path')
-    p.add_argument('--output_dir', type=str, default='../../results/temporal_baseline')
-    p.add_argument('--unsharp', action='store_true', help='Apply Unsharp Masking after temporal avg')
+    p.add_argument('--num_frames', type=int, default=7, help='Frames per sample (REDS)')
+    p.add_argument('--checkpoint', type=str, default=None)
+    p.add_argument('--output_dir', type=str, default='results')
+    p.add_argument('--unsharp', action='store_true')
     p.add_argument('--unsharp_sigma', type=float, default=1.0)
     p.add_argument('--unsharp_strength', type=float, default=0.5)
     p.add_argument('--window', type=int, default=5, help='Temporal averaging window size')
-    p.add_argument('--max_sequences', type=int, default=0, help='Limit sequences for quick test (0=all)')
+    p.add_argument('--max_sequences', type=int, default=0, help='Limit samples (0=all)')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--save_images', action='store_true', help='Save output images')
+    p.add_argument('--save_images', action='store_true')
     return p.parse_args()
+
+
+def build_dataset(args):
+    if args.dataset == 'vimeo':
+        return Vimeo90KSeptuplet(args.data_root, split='test', scale=args.scale)
+    elif args.dataset == 'reds':
+        return REDSDataset(args.data_root, split='val', scale=args.scale,
+                           num_frames=args.num_frames)
+    elif args.dataset == 'reds4':
+        return REDS4Dataset(args.data_root, scale=args.scale,
+                            num_frames=args.num_frames)
+    else:
+        raise ValueError(f'Unknown dataset: {args.dataset}')
 
 
 def spatial_upsample(lr_np, method, scale, srcnn_model=None, device='cpu'):
@@ -136,12 +142,14 @@ def tensor_to_numpy(t):
 
 def main():
     args = parse_args()
-    output_dir = Path(args.output_dir) / args.method
+
+    # Build output dir name
+    method_name = args.method
     if args.method == 'temporal_avg':
-        suffix = f'{args.base_method}_w{args.window}'
+        method_name = f'temporal_avg_{args.base_method}_w{args.window}'
         if args.unsharp:
-            suffix += '_usm'
-        output_dir = Path(args.output_dir) / f'temporal_avg_{suffix}'
+            method_name += '_usm'
+    output_dir = Path(args.output_dir) / args.dataset / method_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load SRCNN if needed
@@ -154,25 +162,30 @@ def main():
         srcnn_model.eval()
 
     # Dataset
-    dataset = Vimeo90KSeptuplet(args.data_root, split='test', scale=args.scale)
+    dataset = build_dataset(args)
     if args.max_sequences > 0:
-        dataset.sequences = dataset.sequences[:args.max_sequences]
+        if hasattr(dataset, 'sequences'):
+            dataset.sequences = dataset.sequences[:args.max_sequences]
+        elif hasattr(dataset, 'samples'):
+            dataset.samples = dataset.samples[:args.max_sequences]
 
     # Metrics
     psnr_all, ssim_all = [], []
     device = args.device
 
-    print(f'Method: {args.method}  |  Sequences: {len(dataset)}  |  Scale: x{args.scale}')
+    print(f'Dataset: {args.dataset} | Method: {method_name} | Samples: {len(dataset)} | Scale: x{args.scale}')
 
     for idx in tqdm(range(len(dataset)), desc='Evaluating'):
         sample = dataset[idx]
-        lr_frames = sample['lr']   # (7, 3, h, w)
-        gt_frames = sample['gt']   # (7, 3, H, W)
+        lr_frames = sample['lr']   # (T, 3, h, w)
+        gt_frames = sample['gt']   # (T, 3, H, W)
         seq_name = sample['seq_name']
+        T = lr_frames.shape[0]
+        center = T // 2
 
         # Spatial upsample all frames
         sr_frames = []
-        for t in range(lr_frames.shape[0]):
+        for t in range(T):
             lr_np = tensor_to_numpy(lr_frames[t])
             sr_np = spatial_upsample(lr_np, effective_method, args.scale, srcnn_model, device)
             sr_frames.append(sr_np)
@@ -187,8 +200,7 @@ def main():
                 fused.append(avg)
             sr_frames = fused
 
-        # Evaluate center frame (index 3)
-        center = 3
+        # Evaluate center frame
         gt_np = tensor_to_numpy(gt_frames[center])
         sr_np = sr_frames[center]
 
@@ -200,26 +212,22 @@ def main():
             seq_out = output_dir / seq_name.replace('/', '_')
             seq_out.mkdir(parents=True, exist_ok=True)
             for t, f in enumerate(sr_frames):
-                Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB) if f.shape[-1] == 3 else f).save(
-                    seq_out / f'im{t + 1}.png'
-                )
-                # Actually, the frame is already RGB from PIL loading
-                Image.fromarray(f).save(seq_out / f'im{t + 1}.png')
+                Image.fromarray(f).save(seq_out / f'{t:08d}.png')
 
     avg_psnr = np.mean(psnr_all)
     avg_ssim = np.mean(ssim_all)
-    print(f'\n===== Results: {args.method} =====')
+    print(f'\n===== Results: {args.dataset} / {method_name} =====')
     print(f'  PSNR: {avg_psnr:.2f} dB')
     print(f'  SSIM: {avg_ssim:.4f}')
-    print(f'  Evaluated on {len(psnr_all)} sequences (center frame)')
+    print(f'  Evaluated on {len(psnr_all)} samples (center frame)')
 
-    # Save results to txt
     with open(output_dir / 'results.txt', 'w') as f:
-        f.write(f'Method: {args.method}\n')
+        f.write(f'Dataset: {args.dataset}\n')
+        f.write(f'Method: {method_name}\n')
         f.write(f'Scale: x{args.scale}\n')
         f.write(f'PSNR: {avg_psnr:.2f}\n')
         f.write(f'SSIM: {avg_ssim:.4f}\n')
-        f.write(f'Sequences: {len(psnr_all)}\n')
+        f.write(f'Samples: {len(psnr_all)}\n')
 
 
 if __name__ == '__main__':
