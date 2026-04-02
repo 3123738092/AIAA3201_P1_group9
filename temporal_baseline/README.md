@@ -83,7 +83,7 @@ AIAA3201_P1_group9/
 
 ```bash
 cd temporal_baseline
-python train_srcnn.py --data_root ../data/vimeo_septuplet --epochs 20 --batch_size 16
+python train_srcnn.py --data_root ../../data/vimeo_septuplet --dataset vimeo --device cuda:1
 ```
 
 ### 2. Run all 7 experiments at once

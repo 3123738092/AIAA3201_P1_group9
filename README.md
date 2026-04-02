@@ -8,3 +8,5 @@ AIAA3201_P1_group9/
 └── temporal_baseline/
 |
 └── (SOTA method)... 
+
+python == 3.10

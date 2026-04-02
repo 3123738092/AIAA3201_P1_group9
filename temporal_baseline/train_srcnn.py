@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 import sys
 
@@ -25,6 +26,51 @@ from models.srcnn import SRCNN
 from utils.metrics import calc_psnr, calc_ssim
 
 
+def save_history_csv(history, save_path):
+    with open(save_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'loss', 'psnr', 'ssim'])
+        for e, l, p, s in zip(
+            history['epoch'], history['loss'], history['psnr'], history['ssim']
+        ):
+            writer.writerow([e, f'{l:.8f}', f'{p:.6f}', f'{s:.6f}'])
+
+
+def save_curves(history, save_path):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('matplotlib is not installed, skipping curve plotting.')
+        return
+
+    epochs = history['epoch']
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(epochs, history['loss'], marker='o', linewidth=1.5)
+    axes[0].set_title('Train Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(epochs, history['psnr'], marker='o', linewidth=1.5, color='tab:green')
+    axes[1].set_title('Validation PSNR')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('PSNR (dB)')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(epochs, history['ssim'], marker='o', linewidth=1.5, color='tab:orange')
+    axes[2].set_title('Validation SSIM')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_ylabel('SSIM')
+    axes[2].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset', type=str, default='reds', choices=['vimeo', 'reds'])
@@ -32,11 +78,19 @@ def parse_args():
                    help='Path to dataset root (vimeo_septuplet/ or reds/)')
     p.add_argument('--scale', type=int, default=4)
     p.add_argument('--patch_size', type=int, default=256, help='GT patch size for training')
-    p.add_argument('--batch_size', type=int, default=16)
-    p.add_argument('--epochs', type=int, default=50)
+    p.add_argument('--batch_size', type=int, default=64)
+    p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--num_frames', type=int, default=7, help='Frames per sample (REDS only)')
     p.add_argument('--save_dir', type=str, default='checkpoints')
+    p.add_argument('--num_workers', type=int, default=16,
+                   help='DataLoader workers (increase on multi-core CPUs)')
+    p.add_argument('--prefetch_factor', type=int, default=4,
+                   help='Batches prefetched by each DataLoader worker')
+    p.add_argument('--pin_memory', action=argparse.BooleanOptionalAction, default=True,
+                   help='Enable pinned host memory for faster H2D transfer')
+    p.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
+                   help='Enable automatic mixed precision on CUDA')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
 
@@ -54,7 +108,7 @@ def build_datasets(args):
     return train_set, test_set
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scale):
+def train_one_epoch(model, loader, criterion, optimizer, device, scale, scaler, use_amp):
     model.train()
     total_loss = 0
     for batch in tqdm(loader, desc='Train', leave=False):
@@ -69,12 +123,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scale):
         )
         gt_flat = gt.view(B * T, C, H, W)
 
-        pred = model(lr_up)
-        loss = criterion(pred, gt_flat)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            pred = model(lr_up)
+            loss = criterion(pred, gt_flat)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         total_loss += loss.item() * B
 
     return total_loss / len(loader.dataset)
@@ -111,24 +171,56 @@ def validate(model, loader, device, scale):
 def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
+    use_amp = args.amp and args.device.startswith('cuda')
+    if args.device.startswith('cuda'):
+        torch.backends.cudnn.benchmark = True
 
     train_set, test_set = build_datasets(args)
     print(f'Dataset: {args.dataset} | Train: {len(train_set)} | Test: {len(test_set)}')
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=2)
+    train_loader_kwargs = {
+        'batch_size': args.batch_size,
+        'shuffle': True,
+        'num_workers': args.num_workers,
+        'pin_memory': args.pin_memory,
+        'drop_last': True,
+    }
+    test_loader_kwargs = {
+        'batch_size': 1,
+        'shuffle': False,
+        'num_workers': max(2, args.num_workers // 2),
+        'pin_memory': args.pin_memory,
+    }
+    if args.num_workers > 0:
+        train_loader_kwargs['persistent_workers'] = True
+        train_loader_kwargs['prefetch_factor'] = args.prefetch_factor
+        test_loader_kwargs['persistent_workers'] = True
+        test_loader_kwargs['prefetch_factor'] = args.prefetch_factor
+
+    train_loader = DataLoader(train_set, **train_loader_kwargs)
+    test_loader = DataLoader(test_set, **test_loader_kwargs)
 
     model = SRCNN().to(args.device)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    print(f'Device: {args.device} | AMP: {use_amp} | Workers: {args.num_workers} | Batch: {args.batch_size}')
+
     best_psnr = 0
+    history = {'epoch': [], 'loss': [], 'psnr': [], 'ssim': []}
     for epoch in range(1, args.epochs + 1):
-        loss = train_one_epoch(model, train_loader, criterion, optimizer, args.device, args.scale)
+        loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, args.device, args.scale, scaler, use_amp
+        )
         psnr, ssim = validate(model, test_loader, args.device, args.scale)
         scheduler.step()
+
+        history['epoch'].append(epoch)
+        history['loss'].append(loss)
+        history['psnr'].append(psnr)
+        history['ssim'].append(ssim)
 
         print(f'Epoch {epoch}/{args.epochs}  Loss: {loss:.6f}  PSNR: {psnr:.2f}  SSIM: {ssim:.4f}')
 
@@ -138,6 +230,12 @@ def main():
             print(f'  -> Saved best model (PSNR={psnr:.2f})')
 
     torch.save(model.state_dict(), os.path.join(args.save_dir, 'srcnn_last.pth'))
+    csv_path = os.path.join(args.save_dir, 'train_history.csv')
+    png_path = os.path.join(args.save_dir, 'train_curves.png')
+    save_history_csv(history, csv_path)
+    save_curves(history, png_path)
+    print(f'Saved training history to: {csv_path}')
+    print(f'Saved training curves to: {png_path}')
     print(f'Training done. Best PSNR: {best_psnr:.2f}')
 
 
