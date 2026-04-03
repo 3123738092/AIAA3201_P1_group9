@@ -6,4 +6,5 @@ Pillow==10.4.0
 scikit-image==0.19.3
 tqdm==4.66.4
 lpips==0.1.4
+pytorch-fid==0.3.0
 matplotlib==3.8.4
