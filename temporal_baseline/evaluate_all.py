@@ -39,7 +39,7 @@ def main():
     p.add_argument('--lpips', action='store_true', help='Compute LPIPS metric')
     p.add_argument('--fid', action='store_true', help='Compute FID metric')
     p.add_argument('--tlpips', action='store_true',
-                   help='Compute tLPIPS (auto-enables --save_all_frames)')
+                   help='Compute tLPIPS (computed in-memory during inference, no extra disk)')
     args = p.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -57,7 +57,7 @@ def main():
     if args.max_sequences > 0:
         infer_base += ['--max_sequences', str(args.max_sequences)]
     if args.tlpips:
-        infer_base += ['--save_all_frames']
+        infer_base += ['--tlpips']
 
     # Base command for evaluation
     eval_base = [
@@ -71,8 +71,6 @@ def main():
         eval_base += ['--lpips']
     if args.fid:
         eval_base += ['--fid']
-    if args.tlpips:
-        eval_base += ['--tlpips']
 
     # 7 experiments
     methods = [

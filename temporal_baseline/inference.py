@@ -99,6 +99,23 @@ def tensor_to_numpy(t):
     return (t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
 
+@torch.no_grad()
+def _calc_tlpips_inmemory(lpips_fn, sr_frames, gt_frames, device):
+    """Compute tLPIPS in-memory: mean_t LPIPS(SR_t - SR_{t-1}, GT_t - GT_{t-1})."""
+    scores = []
+    for i in range(1, len(sr_frames)):
+        diff_sr = sr_frames[i].astype(np.float32) - sr_frames[i - 1].astype(np.float32)
+        diff_gt = gt_frames[i].astype(np.float32) - gt_frames[i - 1].astype(np.float32)
+        # Normalize diffs to [0,1] for LPIPS
+        diff_sr = np.clip(diff_sr / 510.0 + 0.5, 0, 1)
+        diff_gt = np.clip(diff_gt / 510.0 + 0.5, 0, 1)
+        # To tensor [-1, 1]
+        t_sr = torch.from_numpy(diff_sr).permute(2, 0, 1).unsqueeze(0).float().to(device) * 2 - 1
+        t_gt = torch.from_numpy(diff_gt).permute(2, 0, 1).unsqueeze(0).float().to(device) * 2 - 1
+        scores.append(lpips_fn(t_sr, t_gt).item())
+    return np.mean(scores) if scores else 0.0
+
+
 def build_method_name(args):
     if args.method == 'temporal_avg':
         name = f'temporal_avg_{args.base_method}_w{args.window}'
@@ -131,8 +148,9 @@ def parse_args():
     p.add_argument('--window', type=int, default=5, help='Temporal averaging window size')
     p.add_argument('--max_sequences', type=int, default=0, help='Limit samples (0=all)')
     p.add_argument('--save_all_frames', action='store_true',
-                   help='Save all T frames per sample (needed for tLPIPS). '
-                        'Default: save center frame only.')
+                   help='Save all T frames per sample. Default: center frame only.')
+    p.add_argument('--tlpips', action='store_true',
+                   help='Compute tLPIPS in-memory (no extra disk usage)')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
 
@@ -173,15 +191,27 @@ def main():
         elif hasattr(dataset, 'samples'):
             dataset.samples = dataset.samples[:args.max_sequences]
 
+    # Init tLPIPS metric if requested (computed in-memory, no extra disk)
+    tlpips_metric = None
+    if args.tlpips:
+        try:
+            import lpips as _lpips
+            tlpips_metric = _lpips.LPIPS(net='alex').to(args.device).eval()
+            print('tLPIPS: will compute in-memory (no extra disk usage)')
+        except ImportError:
+            print('WARNING: lpips not installed, skipping tLPIPS')
+            args.tlpips = False
+
     print(f'Dataset: {args.dataset} | Method: {method_name} | '
           f'Samples: {len(dataset)} | Scale: x{args.scale}')
     print(f'Output: {output_dir}')
-    if args.save_all_frames:
-        print('Saving ALL frames per sample (for tLPIPS)')
+
+    tlpips_scores = []
 
     for idx in tqdm(range(len(dataset)), desc='Generating SR'):
         sample = dataset[idx]
         lr_frames = sample['lr']   # (T, 3, h, w)
+        gt_frames = sample['gt']   # (T, 3, H, W)
         seq_name = sample['seq_name']
         T = lr_frames.shape[0]
         center = T // 2
@@ -205,17 +235,20 @@ def main():
                 fused.append(avg)
             sr_frames = fused
 
+        # Compute tLPIPS in-memory (SR and GT frames are all available)
+        if args.tlpips and tlpips_metric is not None:
+            gt_np_frames = [tensor_to_numpy(gt_frames[t]) for t in range(T)]
+            score = _calc_tlpips_inmemory(tlpips_metric, sr_frames, gt_np_frames, args.device)
+            tlpips_scores.append(score)
+
+        # Save center frame only (default) or all frames
         if args.save_all_frames:
-            # Save all T frames per sample
             if args.dataset == 'vimeo':
-                # seq_name = "00001/0001" → sr_dir/00001/0001/im{1..7}.png
                 for t in range(T):
                     save_path = output_dir / seq_name / f'im{t + 1}.png'
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     Image.fromarray(sr_frames[t]).save(save_path)
             else:
-                # seq_name = "000/00000003" → sr_dir/000/00000003/00000000.png..
-                # Parse actual frame indices from dataset
                 if hasattr(dataset, 'samples'):
                     seq, center_idx = dataset.samples[idx]
                     half = T // 2
@@ -224,7 +257,6 @@ def main():
                         save_path.parent.mkdir(parents=True, exist_ok=True)
                         Image.fromarray(sr_frames[t_offset]).save(save_path)
         else:
-            # Save center frame only
             sr_center = sr_frames[center]
             if args.dataset == 'vimeo':
                 save_path = output_dir / seq_name / f'im{center + 1}.png'
@@ -232,6 +264,16 @@ def main():
                 save_path = output_dir / f'{seq_name}.png'
             save_path.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(sr_center).save(save_path)
+
+    # Report tLPIPS
+    if tlpips_scores:
+        avg_tlpips = np.mean(tlpips_scores)
+        print(f'\ntLPIPS: {avg_tlpips:.6f} (over {len(tlpips_scores)} sequences)')
+        tlpips_path = output_dir / 'tlpips.txt'
+        with open(tlpips_path, 'w') as f:
+            f.write(f'tLPIPS: {avg_tlpips:.6f}\n')
+            f.write(f'Sequences: {len(tlpips_scores)}\n')
+        print(f'tLPIPS saved to: {tlpips_path}')
 
     print(f'\nDone. SR images saved to: {output_dir}')
     print(f'Next: python evaluate.py --sr_dir {output_dir} '
